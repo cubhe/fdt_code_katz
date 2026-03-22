@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# External data / generated outputs
+dataset
+log/
+image_pred/
+RI_pred/
