@@ -104,6 +104,38 @@ def radial_average_xy(
     return centers[keep], radial[keep]
 
 
+def crop_mtf_section_edges(
+    data: np.ndarray,
+    axis0: np.ndarray,
+    axis1: np.ndarray,
+    margin_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Crop the outer margin from a 2D MTF section and its matching axes."""
+    if not 0.0 <= margin_fraction < 0.5:
+        raise ValueError(f"margin_fraction must be in [0, 0.5), got {margin_fraction}")
+
+    n0, n1 = data.shape
+    trim0 = int(np.floor(n0 * margin_fraction))
+    trim1 = int(np.floor(n1 * margin_fraction))
+
+    if trim0 * 2 >= n0 or trim1 * 2 >= n1:
+        raise ValueError(
+            f"MTF crop is too aggressive for shape={data.shape}, margin_fraction={margin_fraction}"
+        )
+
+    cropped = data[trim0 : n0 - trim0, trim1 : n1 - trim1]
+    axis0_cropped = axis0[trim0 : n0 - trim0]
+    axis1_cropped = axis1[trim1 : n1 - trim1]
+    crop_info = {
+        "margin_fraction_per_side": float(margin_fraction),
+        "total_fraction_removed": float(2.0 * margin_fraction),
+        "trim_axis0_pixels_per_side": int(trim0),
+        "trim_axis1_pixels_per_side": int(trim1),
+        "cropped_shape": [int(v) for v in cropped.shape],
+    }
+    return cropped, axis0_cropped, axis1_cropped, crop_info
+
+
 def cutoff_frequency(freq: np.ndarray, mtf: np.ndarray, target: float) -> float | None:
     if len(freq) == 0:
         return None
@@ -286,6 +318,12 @@ def save_heatmap_plot(
     plt.close(fig)
 
 
+def log1p_unit_scale(data: np.ndarray) -> np.ndarray:
+    data = np.asarray(data, dtype=np.float32)
+    data = np.clip(data, 0.0, None)
+    return np.log1p(data) / np.log(2.0)
+
+
 def evaluate_single_bead_mtf(args: argparse.Namespace) -> dict:
     in_path = Path(args.input)
     out_dir = Path(args.out_dir)
@@ -340,46 +378,67 @@ def evaluate_single_bead_mtf(args: argparse.Namespace) -> dict:
     fy = np.fft.fftshift(np.fft.fftfreq(ny, d=args.dy))
     fz = np.fft.fftshift(np.fft.fftfreq(nz, d=args.dz))
 
-    mtf_xy = mtf[:, :, cz]
-    mtf_xz = mtf[cy, :, :]
-    freq_radial, mtf_radial = radial_average_xy(mtf_xy, fx, fy, bins=args.bins)
+    mtf_xy_full = mtf[:, :, cz]
+    mtf_xz_full = mtf[cy, :, :]
+    mtf_xy, fy_cropped, fx_cropped, mtf_xy_crop_info = crop_mtf_section_edges(
+        mtf_xy_full,
+        fy,
+        fx,
+        args.mtf_crop_fraction,
+    )
+    mtf_xz, fx_xz_cropped, fz_cropped, mtf_xz_crop_info = crop_mtf_section_edges(
+        mtf_xz_full,
+        fx,
+        fz,
+        args.mtf_crop_fraction,
+    )
+    freq_radial, mtf_radial = radial_average_xy(mtf_xy, fx_cropped, fy_cropped, bins=args.bins)
 
-    fx_pos = fx[cx:]
-    fz_pos = fz[cz:]
-    mtf_x_full = mtf_xy[cy, :]
-    mtf_z_full = mtf[cy, cx, :]
-    mtf_x = mtf_xy[cy, cx:]
-    mtf_z = mtf[cy, cx, cz:]
+    cy_xy, cx_xy = mtf_xy.shape[0] // 2, mtf_xy.shape[1] // 2
+    cx_xz, cz_xz = mtf_xz.shape[0] // 2, mtf_xz.shape[1] // 2
+    fx_pos = fx_cropped[cx_xy:]
+    fz_pos = fz_cropped[cz_xz:]
+    mtf_x_full = mtf_xy[cy_xy, :]
+    mtf_z_full = mtf_xz[cx_xz, :]
+    mtf_x = mtf_xy[cy_xy, cx_xy:]
+    mtf_z = mtf_xz[cx_xz, cz_xz:]
 
     mtf50 = cutoff_frequency(freq_radial, mtf_radial, 0.5)
     mtf10 = cutoff_frequency(freq_radial, mtf_radial, 0.1)
 
+    mtf_xy_log = log1p_unit_scale(mtf_xy)
+    mtf_xz_log = log1p_unit_scale(mtf_xz)
+
     save_curve_csv(out_dir / "mtf_xy_radial.csv", freq_radial, mtf_radial)
     save_curve_csv(out_dir / "mtf_x_line.csv", fx_pos, mtf_x)
     save_curve_csv(out_dir / "mtf_z_line.csv", fz_pos, mtf_z)
-    save_curve_csv(out_dir / "mtf_x_line_full.csv", fx, mtf_x_full)
-    save_curve_csv(out_dir / "mtf_z_line_full.csv", fz, mtf_z_full)
+    save_curve_csv(out_dir / "mtf_x_line_full.csv", fx_cropped, mtf_x_full)
+    save_curve_csv(out_dir / "mtf_z_line_full.csv", fz_cropped, mtf_z_full)
+
+    np.save(out_dir / "single_bead_psf_crop.npy", psf_crop.astype(np.float32))
+    np.save(out_dir / "mtf_xy_section_linear.npy", mtf_xy.astype(np.float32))
+    np.save(out_dir / "mtf_xz_section_linear.npy", mtf_xz.astype(np.float32))
+    np.save(out_dir / "mtf_xy_section.npy", mtf_xy_log.astype(np.float32))
+    np.save(out_dir / "mtf_xz_section.npy", mtf_xz_log.astype(np.float32))
 
     if tifffile is not None:
         tifffile.imwrite(out_dir / "single_bead_psf_crop.tif", psf_crop.astype(np.float32))
-        tifffile.imwrite(out_dir / "mtf_xy_section.tif", mtf_xy.astype(np.float32))
-        tifffile.imwrite(out_dir / "mtf_xz_section.tif", mtf_xz.astype(np.float32))
-    else:
-        np.save(out_dir / "single_bead_psf_crop.npy", psf_crop.astype(np.float32))
-        np.save(out_dir / "mtf_xy_section.npy", mtf_xy.astype(np.float32))
-        np.save(out_dir / "mtf_xz_section.npy", mtf_xz.astype(np.float32))
+        tifffile.imwrite(out_dir / "mtf_xy_section_linear.tif", mtf_xy.astype(np.float32))
+        tifffile.imwrite(out_dir / "mtf_xz_section_linear.tif", mtf_xz.astype(np.float32))
+        tifffile.imwrite(out_dir / "mtf_xy_section.tif", mtf_xy_log.astype(np.float32))
+        tifffile.imwrite(out_dir / "mtf_xz_section.tif", mtf_xz_log.astype(np.float32))
 
     psf_xy = psf_crop[:, :, psf_crop.shape[2] // 2]
     psf_xz = psf_crop[psf_crop.shape[0] // 2, :, :]
     raw_xy = raw_crop[:, :, raw_crop.shape[2] // 2]
     fft_xy_log = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(psf_xy))))
 
+    np.save(out_dir / "psf_xy_section.npy", psf_xy.astype(np.float32))
+    np.save(out_dir / "psf_xz_section.npy", psf_xz.astype(np.float32))
+
     if tifffile is not None:
         tifffile.imwrite(out_dir / "psf_xy_section.tif", psf_xy.astype(np.float32))
         tifffile.imwrite(out_dir / "psf_xz_section.tif", psf_xz.astype(np.float32))
-    else:
-        np.save(out_dir / "psf_xy_section.npy", psf_xy.astype(np.float32))
-        np.save(out_dir / "psf_xz_section.npy", psf_xz.astype(np.float32))
 
     psf_peak_yxz = tuple(int(v) for v in np.unravel_index(np.argmax(psf_crop), psf_crop.shape))
     py, px, pz = psf_peak_yxz
@@ -440,12 +499,12 @@ def evaluate_single_bead_mtf(args: argparse.Namespace) -> dict:
 
     xy_canvas = save_heatmap_opencv(
         out_dir / "single_bead_mtf_xy_section.png",
-        mtf_xy,
+        mtf_xy_log,
         cv2_colormap=cv2.COLORMAP_TURBO,
     )
     xz_canvas = save_heatmap_opencv(
         out_dir / "single_bead_mtf_xz_section.png",
-        mtf_xz.T,
+        mtf_xz_log.T,
         cv2_colormap=cv2.COLORMAP_TURBO,
     )
     colorbar_canvas = save_colorbar_opencv(
@@ -463,26 +522,26 @@ def evaluate_single_bead_mtf(args: argparse.Namespace) -> dict:
     )
     save_heatmap_plot(
         out_dir / "single_bead_mtf_xy_section_plot.png",
-        mtf_xy,
-        [float(fx[0]), float(fx[-1]), float(fy[0]), float(fy[-1])],
+        mtf_xy_log,
+        [float(fx_cropped[0]), float(fx_cropped[-1]), float(fy_cropped[0]), float(fy_cropped[-1])],
         cmap="turbo",
     )
     save_heatmap_plot(
         out_dir / "single_bead_mtf_xz_section_plot.png",
-        mtf_xz.T,
-        [float(fx[0]), float(fx[-1]), float(fz[0]), float(fz[-1])],
+        mtf_xz_log.T,
+        [float(fx_xz_cropped[0]), float(fx_xz_cropped[-1]), float(fz_cropped[0]), float(fz_cropped[-1])],
         cmap="turbo",
     )
     save_line_plot(
         out_dir / "single_bead_mtf_x_line_full.png",
-        fx,
+        fx_cropped,
         mtf_x_full,
         xlabel="fx (cycles/um)",
         color="tab:blue",
     )
     save_line_plot(
         out_dir / "single_bead_mtf_z_line_full.png",
-        fz,
+        fz_cropped,
         mtf_z_full,
         xlabel="fz (cycles/um)",
         color="tab:orange",
@@ -516,6 +575,12 @@ def evaluate_single_bead_mtf(args: argparse.Namespace) -> dict:
         "dy_um": float(args.dy),
         "dz_um": float(args.dz),
         "window_used": bool(window_used),
+        "mtf_crop_fraction_per_side": float(args.mtf_crop_fraction),
+        "mtf_crop_total_fraction": float(2.0 * args.mtf_crop_fraction),
+        "mtf_xy_crop_info": mtf_xy_crop_info,
+        "mtf_xz_crop_info": mtf_xz_crop_info,
+        "mtf_section_saved_as": "log1p_unit_scale",
+        "mtf_section_linear_backup_saved": True,
         "mtf50_xy_radial_cyc_per_um": None if mtf50 is None else float(mtf50),
         "mtf10_xy_radial_cyc_per_um": None if mtf10 is None else float(mtf10),
         "psf_peak_yxz_in_crop": [int(v) for v in psf_peak_yxz],
@@ -565,6 +630,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional manual bead center in y x z index.",
     )
     parser.add_argument("--bins", type=int, default=180, help="Number of bins for radial MTF.")
+    parser.add_argument(
+        "--mtf-crop-fraction",
+        type=float,
+        default=1.0 / 3.0,
+        help="Crop this fraction from each side of the MTF XY/XZ sections.",
+    )
     parser.add_argument("--no-window", action="store_true", help="Disable 3D Hann window before FFT.")
     parser.add_argument("--show", action="store_true", help="Display XY/XZ MTF sections via OpenCV imshow.")
     return parser
@@ -579,6 +650,11 @@ def main() -> None:
     print(f"Output dir: {summary['output_dir']}")
     print(f"Detected center (y,x,z): {tuple(summary['center_yxz'])}")
     print(f"Crop size (y,x,z): {tuple(summary['crop_shape_yxz'])}")
+    print(
+        "MTF section crop: "
+        f"{summary['mtf_crop_fraction_per_side']:.4f} per side, "
+        f"{summary['mtf_crop_total_fraction']:.4f} total"
+    )
     print(
         "Crop section sizes: "
         f"PSF XY={tuple(summary['crop_shape_yxz'][:2])}, "

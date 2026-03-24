@@ -149,6 +149,8 @@ def build_experiment_name(args):
         f"_scd{int(_bool_flag(getattr(args, 'dxyz_calibration_enable', 0)))}"
         f"_c2f{int(_bool_flag(args.c2f_enable))}"
         f"_b2c{args.b2c}"
+        f"_b2b{args.b2b}"
+        f"_NB{_format_tag(args.n_b)}"
     )
 
 
@@ -1020,12 +1022,20 @@ def train(args):
         with (torch.autograd.set_detect_anomaly(True)):
 
 
+            light_loc_ids_t = torch.tensor(light_loc_ids).long().cuda()
             RI, intensity_pred, index_pred, locations_calibration = nerf(
-                light_loc_ids,
+                light_loc_ids_t,
                 steps=global_step,
                 steps_c2f=stage_steps,
                 block_sizes=stage_resolutions,
             )
+            # DataParallel gather concatenates non-batch outputs along dim 0;
+            # take only the first replica for RI and locations.
+            if args.num_gpu > 1:
+                ri_size = int(RI.shape[0] // args.num_gpu)
+                RI = RI[:ri_size]
+                loc_size = int(locations_calibration.shape[0] // args.num_gpu)
+                locations_calibration = locations_calibration[:loc_size]
 
 
             # intensity_pred = 1 * intensity_pred.permute(1, 2, 0) / (
@@ -1082,6 +1092,23 @@ def train(args):
                 max_value=torch.max(intensity[i])
                 max_min_intensity[i] = torch.tensor([min_value,max_value])
                 mean_std_intensity[i] = torch.tensor([intensity[i].mean(),intensity[i].std()])
+
+            if getattr(args, "camera_dataset_type", "") != "ucdavis":
+                # Legacy datasets use an additional fixed spatial crop.
+                spatial_mask = torch.zeros(mask_batch.shape[1], mask_batch.shape[2]).float().cuda()
+                spatial_mask[492:692, 412:612] = 1.0
+                mask_batch = mask_batch * spatial_mask.unsqueeze(0)
+
+            # Apply center mask if enabled
+            if _bool_flag(getattr(args, "center_mask_enable", 0)):
+                center_mask_size = getattr(args, "center_mask_size", 200)
+                h, w = mask_batch.shape[1], mask_batch.shape[2]
+                center_mask_cpu = np.zeros((h, w), dtype=np.uint8)
+                cx, cy = w // 2, h // 2
+                r = center_mask_size // 2
+                cv2.circle(center_mask_cpu, (cx, cy), r, 255, -1)
+                center_mask_t = torch.tensor(center_mask_cpu / 255.0).float().cuda()
+                mask_batch = mask_batch * center_mask_t.unsqueeze(0)
 
             #normalize by std and mean
             # intensity_pred = ((intensity_pred.permute(1, 2, 0) - mean_std_intensity_pred[:,0]) / ( mean_std_intensity_pred[:,0])).permute(2, 0, 1)
@@ -1294,7 +1321,9 @@ def train(args):
             locations=locations_calibration.detach().cpu().numpy()
             dxyz = nerf.module.dxyz.detach().cpu().numpy()
             if tifffile is not None:
-                tifffile.imwrite(path + '/ri.tif', np.transpose(RI_cpu.astype(np.float32), (2, 0, 1)))
+                ri_tif = np.transpose(RI_cpu.astype(np.float32), (2, 0, 1))
+                tifffile.imwrite(os.path.join(path, 'ri.tif'), ri_tif)
+                tifffile.imwrite(os.path.join(ri_dir, 'ri.tif'), ri_tif)
             np.save(os.path.join(exp_dir, 'locations_calib.npy'), locations)
             np.save(os.path.join(exp_dir, 'dxyz_calib.npy'), dxyz)
             np.save(os.path.join(exp_dir, 'RI_pred.npy'), RI_cpu)

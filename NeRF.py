@@ -346,10 +346,11 @@ class NPRF(nn.Module):
 
         # Return results
         # In render mode, we return the actual RI values rather than RI-1.33
+        dummy = torch.tensor(0.0, device=intensity.device)
         if not training:
-            return RI, intensity, ..., self.locations
+            return RI, intensity, dummy, self.locations
         else:
-            return RI - 1.33, intensity, ..., self.locations
+            return RI - 1.33, intensity, dummy, self.locations
 
 
     def rendering(self, light_source, refractive_index,free_space=75):
